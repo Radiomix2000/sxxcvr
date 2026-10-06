@@ -95,9 +95,14 @@ class Loopback:
         import SoapySDR
         self.SoapySDR = SoapySDR
         self.args = args
-        # Do not apply any existing calibration while calibrating.
-        self.dev = SoapySDR.Device({'driver': 'sx', 'calibration': 'none'})
+        # Some versions of SoapySDR Python bindings treat a dict with more
+        # than one key as a list of devices to open in parallel, so pass
+        # only the driver and disable the calibration table with a setting.
+        self.dev = SoapySDR.Device({'driver': 'sx'})
         dev = self.dev
+        # Do not apply any existing calibration while calibrating.
+        # All corrections are set explicitly by _write_corrections.
+        dev.writeSetting('CALIBRATION_FILE', 'none')
 
         rates = dev.listSampleRates(SoapySDR.SOAPY_SDR_RX, 0)
         self.fs = min(rates, key=lambda r: abs(r - args.sample_rate))
