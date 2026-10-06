@@ -6,10 +6,15 @@
 #include <SoapySDR/Time.hpp>
 
 #include <string.h>
+#include <algorithm>
 #include <cassert>
 #include <climits>
 #include <chrono>
+#include <cmath>
+#include <complex>
+#include <cstdlib>
 #include <fstream>
+#include <sstream>
 #include <thread>
 #include <mutex>
 
@@ -98,42 +103,165 @@ static struct hat_info read_hat_info(void)
     return info;
 }
 
+// Corrections applied to received samples.
+struct rx_corrections {
+    // Remove DC offset using a high-pass filter
+    bool dc_removal;
+    // Coefficient of the DC removal filter
+    double dc_alpha;
+    // IQ balance correction: y = x + iq * conj(x)
+    std::complex<float> iq;
+};
+
+// Corrections applied to transmitted samples.
+struct tx_corrections {
+    // Added to each sample to cancel LO leakage
+    std::complex<float> dc;
+    // IQ balance predistortion: y = x + iq * conj(x)
+    std::complex<float> iq;
+};
+
 // Convert raw received samples to CF32.
 // TODO: Support other formats and add format as a parameter.
-static inline void convert_rx_buffer(const void *src, size_t src_offset, void *dest, size_t dest_offset, size_t length)
+static inline void convert_rx_buffer(const void *src, size_t src_offset, void *dest, size_t dest_offset, size_t length, const struct rx_corrections &corr, std::complex<double> &dc_state)
 {
     const int32_t *src_ = (const int32_t*)src + src_offset*2;
     float *dest_ = (float*)dest + dest_offset*2;
     const float scaling = 1.0f / 0x80000000L;
-    for (size_t i = 0; i < length*2; i++)
+    const float br = corr.iq.real(), bi = corr.iq.imag();
+    double dc_i = dc_state.real(), dc_q = dc_state.imag();
+    for (size_t i = 0; i < length*2; i+=2)
     {
-        dest_[i] = scaling * (float)src_[i];
+        float fi = scaling * (float)src_[i], fq = scaling * (float)src_[i+1];
+        if (corr.dc_removal) {
+            // First order DC blocker. State is kept in double precision
+            // since the filter coefficient is very small.
+            double di = (double)fi - dc_i, dq = (double)fq - dc_q;
+            dc_i += corr.dc_alpha * di;
+            dc_q += corr.dc_alpha * dq;
+            fi = (float)di;
+            fq = (float)dq;
+        }
+        // y = x + iq * conj(x)
+        dest_[i  ] = fi + br * fi + bi * fq;
+        dest_[i+1] = fq + bi * fi - br * fq;
     }
+    dc_state = std::complex<double>(dc_i, dc_q);
 }
 
 // Convert CF32 to raw transmit samples.
 // TODO: Support other formats and add format as a parameter.
-static inline void convert_tx_buffer(const void *src, size_t src_offset, void *dest, size_t dest_offset, size_t length, float tx_threshold2)
+static inline void convert_tx_buffer(const void *src, size_t src_offset, void *dest, size_t dest_offset, size_t length, float tx_threshold2, const struct tx_corrections &corr)
 {
     const float *src_ = (const float*)src + src_offset*2;
     int32_t *dest_ = (int32_t*)dest + dest_offset*2;
     const float scaling = (float)0x7FFFFFFFL;
+    const float br = corr.iq.real(), bi = corr.iq.imag();
+    const float dr = corr.dc.real(), di = corr.dc.imag();
     for (size_t i = 0; i < length*2; i+=2)
     {
         float fi = src_[i], fq = src_[i+1];
-        int32_t vi = scaling * std::max(std::min(fi, 1.0f), -1.0f);
-        int32_t vq = scaling * std::max(std::min(fq, 1.0f), -1.0f);
+        // y = x + iq * conj(x) + dc
+        float ci = fi + br * fi + bi * fq + dr;
+        float cq = fq + bi * fi - br * fq + di;
+        int32_t vi = scaling * std::max(std::min(ci, 1.0f), -1.0f);
+        int32_t vq = scaling * std::max(std::min(cq, 1.0f), -1.0f);
         // Second lowest bit of each "I" sample controls RX/TX switching.
         // Set the lowest bit to the same value just in case.
         // Let's also reserve the 2 lowest bits of "Q" samples
         // for future extensions and keep them as 0.
         vi &= 0xFFFFFFFCL;
         vq &= 0xFFFFFFFCL;
+        // Threshold is compared to the signal before corrections,
+        // so that DC offset correction alone does not turn transmitter on.
         if (fi*fi + fq*fq >= tx_threshold2)
             vi |= 0b11L;
         dest_[i  ] = vi;
         dest_[i+1] = vq;
     }
+}
+
+// One point of a calibration table.
+struct calibration_point {
+    double frequency;
+    std::complex<double> tx_dc;
+    std::complex<double> tx_iq;
+    std::complex<double> rx_iq;
+};
+
+// Default calibration file path:
+// $XDG_CONFIG_HOME/SoapySX/calibration.txt or ~/.config/SoapySX/calibration.txt
+static std::string default_calibration_path(void)
+{
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    if (xdg != NULL && xdg[0] != '\0')
+        return std::string(xdg) + "/SoapySX/calibration.txt";
+    const char *home = getenv("HOME");
+    if (home != NULL && home[0] != '\0')
+        return std::string(home) + "/.config/SoapySX/calibration.txt";
+    return "";
+}
+
+// Read a calibration table written by tools/calibrate.py.
+// Each non-comment line contains:
+// frequency_hz tx_dc_re tx_dc_im tx_iq_re tx_iq_im rx_iq_re rx_iq_im
+// Returns points sorted by frequency. Throws if the file is malformed.
+static std::vector<struct calibration_point> read_calibration_file(const std::string &path)
+{
+    std::vector<struct calibration_point> table;
+    std::ifstream file(path);
+    if (!file.is_open())
+        return table;
+    std::string line;
+    size_t line_number = 0;
+    while (std::getline(file, line)) {
+        line_number++;
+        size_t comment = line.find('#');
+        if (comment != std::string::npos)
+            line.erase(comment);
+        std::istringstream ss(line);
+        double f, v[6];
+        if (!(ss >> f))
+            continue; // Empty line
+        for (size_t i = 0; i < 6; i++) {
+            if (!(ss >> v[i]))
+                throw std::runtime_error("Malformed calibration file " + path + " at line " + std::to_string(line_number));
+        }
+        table.push_back({
+            f,
+            std::complex<double>(v[0], v[1]),
+            std::complex<double>(v[2], v[3]),
+            std::complex<double>(v[4], v[5]),
+        });
+    }
+    std::sort(table.begin(), table.end(),
+        [](const struct calibration_point &a, const struct calibration_point &b) {
+            return a.frequency < b.frequency;
+        });
+    return table;
+}
+
+// Interpolate calibration table linearly at a given frequency.
+// Values outside the table are clamped to the nearest point.
+// Table must not be empty.
+static struct calibration_point interpolate_calibration(const std::vector<struct calibration_point> &table, double frequency)
+{
+    assert(!table.empty());
+    if (frequency <= table.front().frequency)
+        return table.front();
+    if (frequency >= table.back().frequency)
+        return table.back();
+    size_t i = 1;
+    while (table[i].frequency < frequency)
+        i++;
+    const struct calibration_point &a = table[i-1], &b = table[i];
+    const double t = (frequency - a.frequency) / (b.frequency - a.frequency);
+    return {
+        frequency,
+        a.tx_dc + t * (b.tx_dc - a.tx_dc),
+        a.tx_iq + t * (b.tx_iq - a.tx_iq),
+        a.rx_iq + t * (b.rx_iq - a.rx_iq),
+    };
 }
 
 #define MAX_REGS 0x80
@@ -558,6 +686,22 @@ private:
 
     struct hat_info hat_info;
 
+    // Mutex for DC offset and IQ balance corrections,
+    // so they can be changed while streams are running.
+    mutable std::mutex corr_mutex;
+    struct rx_corrections rx_corr;
+    struct tx_corrections tx_corr;
+    // Cutoff frequency of RX DC removal filter in Hz
+    double rx_dc_cutoff;
+    // State of RX DC removal filter. Only accessed from readStream.
+    std::complex<double> rx_dc_state;
+
+    // Calibration table and the file it was read from.
+    // When the table is not empty, corrections are updated from it
+    // every time frequency is changed.
+    std::vector<struct calibration_point> calibration;
+    std::string calibration_path;
+
     // Convert a SoapySDR nanosecond timestamp to a sample counter.
     int64_t timestamp_to_samples(long long timestamp) const
     {
@@ -624,6 +768,52 @@ private:
         // Enable RX and TX, just for initial testing. This should be done somewhere else.
         set_register_bits(0, 1, 3, 0b111);
         write_registers_to_chip(0, N_INIT_REGISTERS);
+    }
+
+    // Update RX DC removal filter coefficient
+    // after a change of sample rate or cutoff frequency.
+    void update_rx_dc_alpha(void)
+    {
+        std::scoped_lock lock(corr_mutex);
+        rx_corr.dc_alpha = 1.0 - std::exp(-2.0 * M_PI * rx_dc_cutoff / sampleRate);
+    }
+
+    // Load calibration table from a file.
+    // Empty path or "none" disables use of a calibration table.
+    void load_calibration(const std::string &path)
+    {
+        std::scoped_lock lock(reg_mutex);
+        calibration.clear();
+        calibration_path = "";
+        if (path == "" || path == "none")
+            return;
+        calibration = read_calibration_file(path);
+        if (calibration.empty()) {
+            SoapySDR_logf(SOAPY_SDR_DEBUG, "No calibration found in %s", path.c_str());
+        } else {
+            calibration_path = path;
+            SoapySDR_logf(SOAPY_SDR_INFO, "Loaded %zu calibration points from %s",
+                calibration.size(), path.c_str());
+            apply_calibration(SOAPY_SDR_RX);
+            apply_calibration(SOAPY_SDR_TX);
+        }
+    }
+
+    // Update corrections from calibration table
+    // for the current frequency of given direction.
+    void apply_calibration(const int direction)
+    {
+        std::scoped_lock lock(reg_mutex);
+        if (calibration.empty())
+            return;
+        auto point = interpolate_calibration(calibration, getFrequency(direction, 0));
+        std::scoped_lock corr_lock(corr_mutex);
+        if (direction == SOAPY_SDR_RX) {
+            rx_corr.iq = std::complex<float>(point.rx_iq);
+        } else {
+            tx_corr.dc = std::complex<float>(point.tx_dc);
+            tx_corr.iq = std::complex<float>(point.tx_iq);
+        }
     }
 
     bool does_synth_tune(double frequency)
@@ -706,15 +896,30 @@ public:
         buffer_rx(8192),
         buffer_tx(8192),
 
-        hat_info(hat_info)
-    {
-        (void)args;
+        hat_info(hat_info),
 
+        rx_corr{true, 0.0, {0.0f, 0.0f}},
+        tx_corr{{0.0f, 0.0f}, {0.0f, 0.0f}},
+        rx_dc_cutoff(10.0),
+        rx_dc_state(0.0, 0.0)
+    {
         SoapySDR_logf(SOAPY_SDR_INFO, "Initializing SoapySX");
 
         reset_chip();
         init_chip();
+        // Load calibration before detect_clock
+        // so that it gets applied to the initial frequency.
+        // Calibration file path can be given as a device argument
+        // calibration=/path/to/file. calibration=none disables it.
+        try {
+            load_calibration(args.count("calibration") > 0
+                ? args.at("calibration")
+                : default_calibration_path());
+        } catch (std::exception &e) {
+            SoapySDR_logf(SOAPY_SDR_ERROR, "Calibration not used: %s", e.what());
+        }
         detect_clock();
+        update_rx_dc_alpha();
         // Open ALSA devices now when I2S clocks are already running.
         // I am not sure if this makes any difference but just in case.
         alsa_rx.open();
@@ -954,7 +1159,12 @@ public:
 
                 assert((size_t)samples_read <= buffer_rx.size());
                 assert((size_t)samples_read <= numElems);
-                convert_rx_buffer(buffer_rx.data(), 0, buffs[0], 0, samples_read);
+                struct rx_corrections corr;
+                {
+                    std::scoped_lock corr_lock(corr_mutex);
+                    corr = rx_corr;
+                }
+                convert_rx_buffer(buffer_rx.data(), 0, buffs[0], 0, samples_read, corr, rx_dc_state);
 
                 return (int)samples_read;
             } else {
@@ -1087,7 +1297,12 @@ public:
         if (length > buffer_tx.size())
             buffer_tx.resize(length);
 
-        convert_tx_buffer(buffs[0], 0, buffer_tx.data(), 0, length, tx_threshold2);
+        struct tx_corrections corr;
+        {
+            std::scoped_lock corr_lock(corr_mutex);
+            corr = tx_corr;
+        }
+        convert_tx_buffer(buffs[0], 0, buffer_tx.data(), 0, length, tx_threshold2, corr);
 
         if (length > 0) {
             snd_pcm_sframes_t samples_written = snd_pcm_writei(pcm, buffer_tx.data(), length);
@@ -1206,6 +1421,7 @@ public:
         // Enable RX and TX again
         set_register_bits(0x00, 1, 2, 3);
         write_registers_to_chip(0x00, 1);
+        update_rx_dc_alpha();
     }
 
     double getSampleRate(
@@ -1248,6 +1464,7 @@ public:
             set_register_bits(0x06, 0, 8, quantized & 0xFF);
             write_registers_to_chip(0x04, 3);
         }
+        apply_calibration(direction);
     }
 
     double getFrequency(
@@ -1466,8 +1683,140 @@ public:
     }
 
 /***********************************************************************
+ * DC offset and IQ balance corrections
+ **********************************************************************/
+
+    // Automatic DC offset removal is supported for RX.
+    bool hasDCOffsetMode(const int direction, const size_t channel) const
+    {
+        (void)channel;
+        return direction == SOAPY_SDR_RX;
+    }
+
+    void setDCOffsetMode(const int direction, const size_t channel, const bool automatic)
+    {
+        (void)channel;
+        if (direction != SOAPY_SDR_RX)
+            return;
+        std::scoped_lock lock(corr_mutex);
+        rx_corr.dc_removal = automatic;
+    }
+
+    bool getDCOffsetMode(const int direction, const size_t channel) const
+    {
+        (void)channel;
+        if (direction != SOAPY_SDR_RX)
+            return false;
+        std::scoped_lock lock(corr_mutex);
+        return rx_corr.dc_removal;
+    }
+
+    // Manual DC offset correction is supported for TX
+    // to cancel LO leakage.
+    bool hasDCOffset(const int direction, const size_t channel) const
+    {
+        (void)channel;
+        return direction == SOAPY_SDR_TX;
+    }
+
+    void setDCOffset(const int direction, const size_t channel, const std::complex<double> &offset)
+    {
+        (void)channel;
+        if (direction != SOAPY_SDR_TX)
+            return;
+        std::scoped_lock lock(corr_mutex);
+        tx_corr.dc = std::complex<float>(offset);
+    }
+
+    std::complex<double> getDCOffset(const int direction, const size_t channel) const
+    {
+        (void)channel;
+        if (direction != SOAPY_SDR_TX)
+            return 0.0;
+        std::scoped_lock lock(corr_mutex);
+        return std::complex<double>(tx_corr.dc);
+    }
+
+    // IQ balance correction is applied as y = x + balance * conj(x)
+    // to both received and transmitted samples.
+    bool hasIQBalance(const int direction, const size_t channel) const
+    {
+        (void)direction; (void)channel;
+        return true;
+    }
+
+    void setIQBalance(const int direction, const size_t channel, const std::complex<double> &balance)
+    {
+        (void)channel;
+        std::scoped_lock lock(corr_mutex);
+        if (direction == SOAPY_SDR_RX)
+            rx_corr.iq = std::complex<float>(balance);
+        else
+            tx_corr.iq = std::complex<float>(balance);
+    }
+
+    std::complex<double> getIQBalance(const int direction, const size_t channel) const
+    {
+        (void)channel;
+        std::scoped_lock lock(corr_mutex);
+        if (direction == SOAPY_SDR_RX)
+            return std::complex<double>(rx_corr.iq);
+        else
+            return std::complex<double>(tx_corr.iq);
+    }
+
+/***********************************************************************
  * Other settings
  **********************************************************************/
+
+    SoapySDR::ArgInfoList getSettingInfo(void) const
+    {
+        SoapySDR::ArgInfoList infos;
+        {
+            SoapySDR::ArgInfo info;
+            info.key = "PA";
+            info.name = "PA control";
+            info.description = "ON: always on, OFF: always off, AUTO: controlled by TX stream";
+            info.type = SoapySDR::ArgInfo::STRING;
+            info.value = "AUTO";
+            info.options = {"AUTO", "ON", "OFF"};
+            infos.push_back(info);
+        }
+        {
+            SoapySDR::ArgInfo info;
+            info.key = "CALIBRATION_FILE";
+            info.name = "Calibration file";
+            info.description = "Path of DC offset and IQ balance calibration table. Empty or none disables it.";
+            info.type = SoapySDR::ArgInfo::STRING;
+            info.value = default_calibration_path();
+            infos.push_back(info);
+        }
+        {
+            SoapySDR::ArgInfo info;
+            info.key = "RX_DC_CUTOFF";
+            info.name = "RX DC removal cutoff";
+            info.description = "Cutoff frequency of RX DC removal filter";
+            info.units = "Hz";
+            info.type = SoapySDR::ArgInfo::FLOAT;
+            info.value = "10";
+            info.range = SoapySDR::Range(0.1, 1000.0);
+            infos.push_back(info);
+        }
+        return infos;
+    }
+
+    std::string readSetting(const std::string & key) const
+    {
+        if (key == "CALIBRATION_FILE") {
+            std::scoped_lock lock(reg_mutex);
+            return calibration_path;
+        }
+        if (key == "RX_DC_CUTOFF") {
+            std::scoped_lock lock(corr_mutex);
+            return std::to_string(rx_dc_cutoff);
+        }
+        return "";
+    }
 
     void writeSetting(
         const std::string & key,
@@ -1489,10 +1838,16 @@ public:
                 gpio_tx.set_value(1);
                 gpio_rx.set_value(1);
             }
+        } else if (key == "CALIBRATION_FILE") {
+            load_calibration(value);
+        } else if (key == "RX_DC_CUTOFF") {
+            {
+                std::scoped_lock lock(corr_mutex);
+                rx_dc_cutoff = std::min(std::max(std::stod(value), 0.1), 1000.0);
+            }
+            update_rx_dc_alpha();
         }
     }
-
-    // TODO: readSetting, getSettingInfo
 
 /***********************************************************************
  * Low level interfaces
