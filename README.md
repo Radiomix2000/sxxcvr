@@ -62,5 +62,6 @@ The results are written to `~/.config/SoapySX/calibration.txt`.
 SoapySX loads this file when the device is opened and sets the corrections
 by interpolating the table every time the frequency is changed.
 Another file can be given with the device argument `calibration=/path/to/file`
-(for example `SoapySDR.Device('driver=sx,calibration=/path/to/file')` in Python)
+(for example `SoapySDR.Device.make([{'driver': 'sx', 'calibration': '/path/to/file'}])[0]`
+in Python, since some versions of the bindings misinterpret a plain dict)
 or the setting `CALIBRATION_FILE`, and `none` disables it.

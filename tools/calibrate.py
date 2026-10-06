@@ -95,10 +95,11 @@ class Loopback:
         import SoapySDR
         self.SoapySDR = SoapySDR
         self.args = args
-        # Some versions of SoapySDR Python bindings treat a dict with more
-        # than one key as a list of devices to open in parallel, so pass
-        # only the driver and disable the calibration table with a setting.
-        self.dev = SoapySDR.Device({'driver': 'sx'})
+        # Some versions of SoapySDR Python bindings convert a dict passed
+        # to SoapySDR.Device into a list of its keys, which fails with
+        # "no match". A list of dicts is not ambiguous, so open the device
+        # with the parallel version of make.
+        self.dev = SoapySDR.Device.make([{'driver': 'sx'}])[0]
         dev = self.dev
         # Do not apply any existing calibration while calibrating.
         # All corrections are set explicitly by _write_corrections.
@@ -143,6 +144,7 @@ class Loopback:
         self.dev.closeStream(self.tx)
         self.dev.setAntenna(SoapySDR.SOAPY_SDR_RX, 0, 'RX')
         self.dev.writeSetting('PA', 'AUTO')
+        self.dev.close()
 
     def _write_corrections(self):
         SoapySDR = self.SoapySDR
