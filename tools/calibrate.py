@@ -517,7 +517,7 @@ def main():
             out.write('# TX gains: DAC %.0f dB, MIXER %.0f dB. Sample rate %.0f Hz.%s\n'
                 % (args.tx_dac, args.tx_mixer, lb.fs, ' SIMULATED' if args.simulate else ''))
             out.write('# Corrections are applied as y = x + iq * conj(x) + dc\n')
-            out.write('# frequency_hz tx_dc_re tx_dc_im tx_iq_re tx_iq_im rx_iq_re rx_iq_im\n')
+            out.write('# frequency_hz tx_dc_re tx_dc_im tx_iq_re tx_iq_im rx_iq_re rx_iq_im tx_dac tx_mixer\n')
             for frequency in frequencies:
                 print('%.3f MHz' % (frequency * 1e-6))
                 lb.set_frequency(frequency)
@@ -532,10 +532,11 @@ def main():
                         % (100 * abs(corr.tx_dc)))
                 print('  tx_dc=%s tx_iq=%s rx_iq=%s' % (
                     np.round(corr.tx_dc, 5), np.round(corr.tx_iq, 5), np.round(corr.rx_iq, 5)))
-                out.write('%.0f %.7f %.7f %.7f %.7f %.7f %.7f\n' % (frequency,
+                out.write('%.0f %.7f %.7f %.7f %.7f %.7f %.7f %.1f %.1f\n' % (frequency,
                     corr.tx_dc.real, corr.tx_dc.imag,
                     corr.tx_iq.real, corr.tx_iq.imag,
-                    corr.rx_iq.real, corr.rx_iq.imag))
+                    corr.rx_iq.real, corr.rx_iq.imag,
+                    args.tx_dac, args.tx_mixer))
                 out.flush()
         os.replace(tmp_output, args.output)
     except Exception as e:

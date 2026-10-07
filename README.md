@@ -81,21 +81,32 @@ run the application with `SOAPY_SDR_LOG_LEVEL=DEBUG`.
 
 ### Built-in calibration
 SoapySX can also run the same calibration by itself at the current
-frequencies and TX gains:
+frequencies and TX gains, and add the result to the calibration table.
 
-* With the device argument `auto_calibrate=1`, calibration runs when
-  streams are activated, if it has not been done yet or if TX or RX
-  frequency has changed by more than 500 kHz or TX gains have changed
-  since the last calibration.
-* Writing the setting `CALIBRATE` (any value) runs calibration immediately.
-  Streams must not be active.
+To enable automatic calibration, create `~/.config/SoapySX/soapysx.conf`
+containing
+```
+auto_calibrate=1
+```
+or give the device argument `auto_calibrate=1`.
+Then, when streams are activated, SoapySX checks whether the calibration
+table has a point calibrated with the current TX gains (DAC and MIXER)
+within 500 kHz of the current TX frequency, and a point within 500 kHz
+of the current RX frequency. If not, it calibrates and appends the result
+to the calibration file, so the next time the stored result is used.
+The distance can be changed with `calibration_tolerance=<Hz>`
+in the same file. Points written by older versions of `tools/calibrate.py`
+without TX gains are used with any gains but do not prevent
+automatic calibration.
+
+Writing the setting `CALIBRATE` (any value) runs calibration immediately.
+Streams must not be active.
 
 Calibration takes a few seconds and the test tone is transmitted
 through the external PA at the current TX frequency and gains,
 so use it only with a dummy load or when transmitting the tone is
 acceptable. Progress and results are logged. If calibration fails,
 for example because the loopback signal is not received,
-the previous corrections are kept.
+nothing is saved and the previous corrections are kept.
 
-The result is used near the calibrated frequencies and, if no calibration
-table is loaded, also at other frequencies. It is not saved to a file.
+Note that `tools/calibrate.py` overwrites the whole calibration file.
