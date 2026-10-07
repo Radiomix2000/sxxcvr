@@ -46,6 +46,9 @@ so SoapySX corrects the samples digitally:
 * RX IQ balance, TX IQ balance and TX DC offset (cancelling LO leakage)
   can be set with `setIQBalance` and `setDCOffset`.
   Corrections are applied as `y = x + iq * conj(x) + dc`.
+  Values set by an application are added to the values from the
+  calibration table described below, so applications that set them
+  to zero do not cancel the calibration.
 
 The correction coefficients can be measured with the internal RF loopback
 of SX1255 by running
@@ -65,3 +68,10 @@ Another file can be given with the device argument `calibration=/path/to/file`
 (for example `SoapySDR.Device.make([{'driver': 'sx', 'calibration': '/path/to/file'}])[0]`
 in Python, since some versions of the bindings misinterpret a plain dict)
 or the setting `CALIBRATION_FILE`, and `none` disables it.
+
+When the device is opened, SoapySX logs either
+`Loaded N calibration points from ...` or `No calibration table found in ...`.
+Note that the default path depends on the user running the application,
+so if it runs as root, the file is looked up in `/root/.config/SoapySX/`.
+To see the corrections applied after each frequency change,
+run the application with `SOAPY_SDR_LOG_LEVEL=DEBUG`.

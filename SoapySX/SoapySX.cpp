@@ -689,8 +689,17 @@ private:
     // Mutex for DC offset and IQ balance corrections,
     // so they can be changed while streams are running.
     mutable std::mutex corr_mutex;
+    // Corrections actually applied to samples.
+    // IQ balance and TX DC offset are the sum of values interpolated
+    // from the calibration table and values set by the application,
+    // so that applications setting them to zero (as many do by default)
+    // do not override the calibration.
     struct rx_corrections rx_corr;
     struct tx_corrections tx_corr;
+    // Values from calibration table at current frequencies
+    std::complex<double> table_rx_iq, table_tx_iq, table_tx_dc;
+    // Values set by setIQBalance and setDCOffset
+    std::complex<double> user_rx_iq, user_tx_iq, user_tx_dc;
     // Cutoff frequency of RX DC removal filter in Hz
     double rx_dc_cutoff;
     // State of RX DC removal filter. Only accessed from readStream.
@@ -778,6 +787,15 @@ private:
         rx_corr.dc_alpha = 1.0 - std::exp(-2.0 * M_PI * rx_dc_cutoff / sampleRate);
     }
 
+    // Update corrections applied to samples.
+    // Must be called with corr_mutex locked.
+    void update_corrections(void)
+    {
+        rx_corr.iq = std::complex<float>(table_rx_iq + user_rx_iq);
+        tx_corr.iq = std::complex<float>(table_tx_iq + user_tx_iq);
+        tx_corr.dc = std::complex<float>(table_tx_dc + user_tx_dc);
+    }
+
     // Load calibration table from a file.
     // Empty path or "none" disables use of a calibration table.
     void load_calibration(const std::string &path)
@@ -785,11 +803,16 @@ private:
         std::scoped_lock lock(reg_mutex);
         calibration.clear();
         calibration_path = "";
+        {
+            std::scoped_lock corr_lock(corr_mutex);
+            table_rx_iq = table_tx_iq = table_tx_dc = 0.0;
+            update_corrections();
+        }
         if (path == "" || path == "none")
             return;
         calibration = read_calibration_file(path);
         if (calibration.empty()) {
-            SoapySDR_logf(SOAPY_SDR_DEBUG, "No calibration found in %s", path.c_str());
+            SoapySDR_logf(SOAPY_SDR_INFO, "No calibration table found in %s", path.c_str());
         } else {
             calibration_path = path;
             SoapySDR_logf(SOAPY_SDR_INFO, "Loaded %zu calibration points from %s",
@@ -809,11 +832,17 @@ private:
         auto point = interpolate_calibration(calibration, getFrequency(direction, 0));
         std::scoped_lock corr_lock(corr_mutex);
         if (direction == SOAPY_SDR_RX) {
-            rx_corr.iq = std::complex<float>(point.rx_iq);
+            table_rx_iq = point.rx_iq;
         } else {
-            tx_corr.dc = std::complex<float>(point.tx_dc);
-            tx_corr.iq = std::complex<float>(point.tx_iq);
+            table_tx_dc = point.tx_dc;
+            table_tx_iq = point.tx_iq;
         }
+        update_corrections();
+        SoapySDR_logf(SOAPY_SDR_DEBUG, "Calibration at %.0f Hz: tx_dc=%f%+fj tx_iq=%f%+fj rx_iq=%f%+fj",
+            point.frequency,
+            table_tx_dc.real(), table_tx_dc.imag(),
+            table_tx_iq.real(), table_tx_iq.imag(),
+            table_rx_iq.real(), table_rx_iq.imag());
     }
 
     bool does_synth_tune(double frequency)
@@ -900,6 +929,8 @@ public:
 
         rx_corr{true, 0.0, {0.0f, 0.0f}},
         tx_corr{{0.0f, 0.0f}, {0.0f, 0.0f}},
+        table_rx_iq(0.0), table_tx_iq(0.0), table_tx_dc(0.0),
+        user_rx_iq(0.0), user_tx_iq(0.0), user_tx_dc(0.0),
         rx_dc_cutoff(10.0),
         rx_dc_state(0.0, 0.0)
     {
@@ -1712,7 +1743,7 @@ public:
     }
 
     // Manual DC offset correction is supported for TX
-    // to cancel LO leakage.
+    // to cancel LO leakage. It is added to the value from calibration table.
     bool hasDCOffset(const int direction, const size_t channel) const
     {
         (void)channel;
@@ -1725,7 +1756,8 @@ public:
         if (direction != SOAPY_SDR_TX)
             return;
         std::scoped_lock lock(corr_mutex);
-        tx_corr.dc = std::complex<float>(offset);
+        user_tx_dc = offset;
+        update_corrections();
     }
 
     std::complex<double> getDCOffset(const int direction, const size_t channel) const
@@ -1734,11 +1766,12 @@ public:
         if (direction != SOAPY_SDR_TX)
             return 0.0;
         std::scoped_lock lock(corr_mutex);
-        return std::complex<double>(tx_corr.dc);
+        return user_tx_dc;
     }
 
     // IQ balance correction is applied as y = x + balance * conj(x)
     // to both received and transmitted samples.
+    // Balance is added to the value from calibration table.
     bool hasIQBalance(const int direction, const size_t channel) const
     {
         (void)direction; (void)channel;
@@ -1750,9 +1783,10 @@ public:
         (void)channel;
         std::scoped_lock lock(corr_mutex);
         if (direction == SOAPY_SDR_RX)
-            rx_corr.iq = std::complex<float>(balance);
+            user_rx_iq = balance;
         else
-            tx_corr.iq = std::complex<float>(balance);
+            user_tx_iq = balance;
+        update_corrections();
     }
 
     std::complex<double> getIQBalance(const int direction, const size_t channel) const
@@ -1760,9 +1794,9 @@ public:
         (void)channel;
         std::scoped_lock lock(corr_mutex);
         if (direction == SOAPY_SDR_RX)
-            return std::complex<double>(rx_corr.iq);
+            return user_rx_iq;
         else
-            return std::complex<double>(tx_corr.iq);
+            return user_tx_iq;
     }
 
 /***********************************************************************
