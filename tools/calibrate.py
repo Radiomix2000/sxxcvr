@@ -78,15 +78,38 @@ def correlate(x, n, freq):
     return np.sum(x * window * np.exp(-1j * phase)) / np.sum(window)
 
 
+# Frequencies, in units of sample rate, where no signal is expected.
+# Used to estimate the noise level of measurements.
+NOISE_FREQUENCIES = (5.5/32, -5.5/32, 7.5/32, -7.5/32, 9.5/32, -9.5/32)
+
+
 def analyze(x, n, lo_offset, tone):
     """Measure the wanted tone and unwanted products in received signal."""
+    noise = [correlate(x, n, f) for f in NOISE_FREQUENCIES]
     return {
         'tone':     correlate(x, n, lo_offset + tone),
         'tx_lo':    correlate(x, n, lo_offset),
         'tx_image': correlate(x, n, lo_offset - tone),
         'rx_image': correlate(x, n, -(lo_offset + tone)),
+        'noise':    float(np.sqrt(np.mean(np.abs(noise) ** 2))),
         'peak':     float(np.max(np.abs(x))),
     }
+
+
+def spectrum_peaks(x, count=8):
+    """Find strongest peaks in spectrum of x.
+    Returns a list of (frequency in units of sample rate, level in dBFS)."""
+    window = np.hanning(len(x))
+    spectrum = np.abs(np.fft.fftshift(np.fft.fft(x * window))) / np.sum(window)
+    freqs = np.fft.fftshift(np.fft.fftfreq(len(x)))
+    peaks = []
+    s = spectrum.copy()
+    for _ in range(count):
+        i = int(np.argmax(s))
+        peaks.append((freqs[i], db(spectrum[i])))
+        # Exclude neighbourhood of the peak
+        s[max(i - 8, 0):i + 9] = 0.0
+    return peaks
 
 
 class Loopback:
@@ -113,7 +136,8 @@ class Loopback:
         dev.setAntenna(SoapySDR.SOAPY_SDR_RX, 0, 'LB')
         # PA driver of SX1255 must be enabled for the loopback to work.
         dev.setAntenna(SoapySDR.SOAPY_SDR_TX, 0, 'TX')
-        dev.writeSetting('PA', 'OFF')
+        dev.writeSetting('PA', args.pa.upper())
+        self.amplitude = args.amplitude
         dev.setDCOffsetMode(SoapySDR.SOAPY_SDR_RX, 0, False)
 
         dev.setGain(SoapySDR.SOAPY_SDR_TX, 0, 'DAC', args.tx_dac)
@@ -186,7 +210,7 @@ class Loopback:
         n_tx = n_rx + self.args.latency
         self.next_tx = n_tx + self.chunk
         n = np.arange(n_tx, n_tx + self.chunk) - self.n_ref
-        tx = (self.args.amplitude * np.exp(2j * np.pi * np.mod(TONE * n, 1.0))).astype(np.complex64)
+        tx = (self.amplitude * np.exp(2j * np.pi * np.mod(TONE * n, 1.0))).astype(np.complex64)
         self.dev.writeStream(self.tx, [tx], len(tx), SoapySDR.SOAPY_SDR_HAS_TIME,
             SoapySDR.ticksToTimeNs(n_tx, self.fs))
         return n_rx, self.rx_buf[:ret.ret].copy()
@@ -220,6 +244,17 @@ class Loopback:
     def measure(self):
         x, n = self.capture()
         return analyze(x, n, self.lo_offset, TONE)
+
+    def configure(self, antenna=None, pa=None, amplitude=None):
+        """Change settings for diagnostics."""
+        SoapySDR = self.SoapySDR
+        if antenna is not None:
+            self.dev.setAntenna(SoapySDR.SOAPY_SDR_RX, 0, antenna)
+        if pa is not None:
+            self.dev.writeSetting('PA', pa)
+        if amplitude is not None:
+            self.amplitude = amplitude
+        self.valid_from = max(self._now(), self.next_tx) + self.args.settle
 
     def adjust_rx_gain(self):
         """Find a PGA gain giving a reasonable signal level."""
@@ -337,6 +372,15 @@ def calibrate_frequency(lb, corr, args):
     lb.adjust_rx_gain()
     results = {}
 
+    # Make sure the tone is actually received through the loopback.
+    # Otherwise the search would only follow noise.
+    m = lb.measure()
+    snr = db(m['tone']) - db(m['noise'])
+    print('  Tone %.1f dBFS, noise %.1f dBFS, SNR %.1f dB' % (db(m['tone']), db(m['noise']), snr))
+    if snr < args.min_snr:
+        raise RuntimeError('Tone is not received through the loopback (SNR %.1f dB < %.1f dB). '
+            'Run with --diagnose to investigate.' % (snr, args.min_snr))
+
     # RX IQ balance: null RX image of the tone relative to the tone.
     # The ratio is normalized with the conjugate of the tone so that
     # it does not depend on phase of the received signal.
@@ -363,6 +407,31 @@ def calibrate_frequency(lb, corr, args):
         'tx_lo':    db(m['tx_lo'] / m['tone']),
     }
     return results, final
+
+
+def diagnose(lb, frequency, args):
+    """Show strongest spectral components received with different settings,
+    to check whether the TX tone gets through the loopback."""
+    lb.set_frequency(frequency)
+    print('Diagnostics at %.3f MHz, RX PGA %.0f dB' % (frequency * 1e-6, lb.rx_pga))
+    print('Frequencies are relative to RX LO, in units of fs/32. Expected:')
+    print('  %+.2f tone, %+.2f TX LO leakage, %+.2f TX image, %+.2f RX image, 0 RX DC' % (
+        32 * (lb.lo_offset + TONE), 32 * lb.lo_offset, 32 * (lb.lo_offset - TONE), -32 * (lb.lo_offset + TONE)))
+    tests = (
+        ('RF loopback, PA OFF, tone on',  'LB', 'OFF',  args.amplitude),
+        ('RF loopback, PA OFF, tone off', 'LB', 'OFF',  0.0),
+        ('RF loopback, PA AUTO, tone on', 'LB', 'AUTO', args.amplitude),
+        ('RX antenna, PA OFF, tone on',   'RX', 'OFF',  args.amplitude),
+    )
+    for name, antenna, pa, amplitude in tests:
+        lb.configure(antenna=antenna, pa=pa, amplitude=amplitude)
+        x, n = lb.capture()
+        m = analyze(x, n, lb.lo_offset, TONE)
+        print('%s:' % name)
+        print('  tone %.1f dBFS, noise %.1f dBFS, peak sample %.4f' % (db(m['tone']), db(m['noise']), m['peak']))
+        print('  strongest components: ' + ', '.join(
+            '%+.2f: %.1f dBFS' % (32 * f, level) for f, level in spectrum_peaks(x)))
+    lb.configure(antenna='LB', pa=args.pa.upper(), amplitude=args.amplitude)
 
 
 def parse_frequencies(text):
@@ -396,6 +465,12 @@ def main():
     parser.add_argument('--step', type=float, default=0.01, help='Perturbation for Jacobian estimation (default: %(default)s)')
     parser.add_argument('--iterations', type=int, default=4, help='Maximum Newton iterations (default: %(default)s)')
     parser.add_argument('--target', type=float, default=-70.0, help='Stop when below this level in dBc (default: %(default)s)')
+    parser.add_argument('--pa', choices=('off', 'auto'), default='off',
+        help='External PA control during calibration (default: %(default)s)')
+    parser.add_argument('--min-snr', type=float, default=40.0,
+        help='Minimum SNR of the received tone in dB (default: %(default)s)')
+    parser.add_argument('--diagnose', action='store_true',
+        help='Only show received spectrum with different settings at the first frequency')
     parser.add_argument('--simulate', action='store_true', help='Use a simulated device to test the algorithm')
     parser.add_argument('--seed', type=int, default=1, help='Random seed for simulation')
     args = parser.parse_args()
@@ -403,14 +478,27 @@ def main():
     frequencies = parse_frequencies(args.frequencies)
     lb = Simulation(args) if args.simulate else Loopback(args)
 
+    if args.diagnose:
+        if args.simulate:
+            print('--diagnose needs real hardware')
+            return 1
+        try:
+            diagnose(lb, frequencies[0], args)
+        finally:
+            lb.close()
+        return 0
+
     if os.path.dirname(args.output):
         os.makedirs(os.path.dirname(args.output), exist_ok=True)
 
     print('Sample rate %.0f Hz' % lb.fs)
     corr = Corrections()
     worst = {'rx_image': -999.0, 'tx_image': -999.0, 'tx_lo': -999.0}
+    # Write to a temporary file so that an existing table
+    # is replaced only if calibration succeeds.
+    tmp_output = args.output + '.tmp'
     try:
-        with open(args.output, 'w') as out:
+        with open(tmp_output, 'w') as out:
             out.write('# SoapySX calibration table written by tools/calibrate.py on %s\n'
                 % datetime.datetime.now().isoformat(timespec='seconds'))
             out.write('# TX gains: DAC %.0f dB, MIXER %.0f dB. Sample rate %.0f Hz.%s\n'
@@ -432,6 +520,13 @@ def main():
                     corr.tx_iq.real, corr.tx_iq.imag,
                     corr.rx_iq.real, corr.rx_iq.imag))
                 out.flush()
+        os.replace(tmp_output, args.output)
+    except Exception as e:
+        print('Calibration failed: %s' % e)
+        print('Existing calibration table was not changed.')
+        if os.path.exists(tmp_output):
+            os.remove(tmp_output)
+        return 1
     finally:
         lb.close()
 
