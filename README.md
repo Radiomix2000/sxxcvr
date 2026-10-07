@@ -78,3 +78,24 @@ Note that the default path depends on the user running the application,
 so if it runs as root, the file is looked up in `/root/.config/SoapySX/`.
 To see the corrections applied after each frequency change,
 run the application with `SOAPY_SDR_LOG_LEVEL=DEBUG`.
+
+### Built-in calibration
+SoapySX can also run the same calibration by itself at the current
+frequencies and TX gains:
+
+* With the device argument `auto_calibrate=1`, calibration runs when
+  streams are activated, if it has not been done yet or if TX or RX
+  frequency has changed by more than 500 kHz or TX gains have changed
+  since the last calibration.
+* Writing the setting `CALIBRATE` (any value) runs calibration immediately.
+  Streams must not be active.
+
+Calibration takes a few seconds and the test tone is transmitted
+through the external PA at the current TX frequency and gains,
+so use it only with a dummy load or when transmitting the tone is
+acceptable. Progress and results are logged. If calibration fails,
+for example because the loopback signal is not received,
+the previous corrections are kept.
+
+The result is used near the calibrated frequencies and, if no calibration
+table is loaded, also at other frequencies. It is not saved to a file.

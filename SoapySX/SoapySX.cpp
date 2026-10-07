@@ -647,6 +647,77 @@ public:
 
 
 /***********************************************************************
+ * Built-in calibration helpers
+ **********************************************************************/
+
+// Frequencies used by calibration, in units of sample rate.
+// TX LO is at the calibrated frequency and TX sends a tone at CAL_TONE.
+// RX LO is tuned CAL_LO_OFFSET below TX LO, so in received signal:
+//   CAL_LO_OFFSET + CAL_TONE   wanted tone
+//   CAL_LO_OFFSET              TX LO leakage
+//   CAL_LO_OFFSET - CAL_TONE   TX image
+//   -(CAL_LO_OFFSET+CAL_TONE)  RX image
+// The same plan is used by tools/calibrate.py.
+static const double CAL_LO_OFFSET = 1.0 / 32.0;
+static const double CAL_TONE = 3.0 / 32.0;
+// Frequencies where no signal is expected, for estimating noise level
+// Results of built-in calibration are used within this distance
+// from calibrated frequency, and automatic calibration is redone
+// if frequency changes more than this.
+static const double AUTOCAL_TOLERANCE = 500e3;
+static const double CAL_NOISE_FREQS[] = { 5.5/32, -5.5/32, 7.5/32, -7.5/32, 9.5/32, -9.5/32 };
+
+struct cal_measurement {
+    std::complex<double> tone, tx_lo, tx_image, rx_image;
+    double noise, peak;
+};
+
+// Complex amplitude of a tone at normalized frequency freq in signal x,
+// whose first sample has index n0. Uses a Hann window.
+static std::complex<double> correlate_tone(const std::vector<std::complex<float>> &x, int64_t n0, double freq)
+{
+    const size_t n = x.size();
+    std::complex<double> acc = 0.0;
+    double wsum = 0.0;
+    // Rotate a phasor instead of computing it for every sample
+    std::complex<double> phasor = std::polar(1.0, -2.0 * M_PI * std::fmod(freq * (double)n0, 1.0));
+    const std::complex<double> rotation = std::polar(1.0, -2.0 * M_PI * freq);
+    const std::complex<double> w_rotation = std::polar(1.0, 2.0 * M_PI / (double)(n - 1));
+    std::complex<double> w_phasor = 1.0;
+    for (size_t i = 0; i < n; i++) {
+        // Hann window
+        double w = 0.5 - 0.5 * w_phasor.real();
+        acc += std::complex<double>(x[i]) * w * phasor;
+        wsum += w;
+        phasor *= rotation;
+        w_phasor *= w_rotation;
+    }
+    return acc / wsum;
+}
+
+static struct cal_measurement cal_analyze(const std::vector<std::complex<float>> &x, int64_t n0, double lo_offset)
+{
+    struct cal_measurement m;
+    m.tone     = correlate_tone(x, n0, lo_offset + CAL_TONE);
+    m.tx_lo    = correlate_tone(x, n0, lo_offset);
+    m.tx_image = correlate_tone(x, n0, lo_offset - CAL_TONE);
+    m.rx_image = correlate_tone(x, n0, -(lo_offset + CAL_TONE));
+    double p = 0.0;
+    for (double f : CAL_NOISE_FREQS)
+        p += std::norm(correlate_tone(x, n0, f));
+    m.noise = std::sqrt(p / (sizeof(CAL_NOISE_FREQS) / sizeof(CAL_NOISE_FREQS[0])));
+    m.peak = 0.0;
+    for (auto v : x)
+        m.peak = std::max(m.peak, (double)std::abs(v));
+    return m;
+}
+
+static double to_db(double v)
+{
+    return 20.0 * std::log10(std::max(v, 1e-15));
+}
+
+/***********************************************************************
  * Device interface
  **********************************************************************/
 class SoapySX : public SoapySDR::Device
@@ -710,6 +781,21 @@ private:
     // every time frequency is changed.
     std::vector<struct calibration_point> calibration;
     std::string calibration_path;
+
+    // Result of built-in calibration (CALIBRATE setting
+    // or auto_calibrate device argument).
+    struct {
+        bool valid;
+        double tx_frequency, rx_frequency;
+        // TX gain register value during calibration
+        uint8_t tx_gain_reg;
+        std::complex<double> tx_dc, tx_iq, rx_iq;
+    } autocal;
+    // Calibrate automatically when streams are activated
+    // if frequencies or TX gains have changed since last calibration.
+    bool auto_calibrate;
+    // Current value of PA setting
+    std::string pa_mode;
 
     // Convert a SoapySDR nanosecond timestamp to a sample counter.
     int64_t timestamp_to_samples(long long timestamp) const
@@ -822,14 +908,32 @@ private:
         }
     }
 
-    // Update corrections from calibration table
+    // Update corrections from built-in calibration or calibration table
     // for the current frequency of given direction.
+    // Result of built-in calibration is used near the frequency where it
+    // was done, and also elsewhere if there is no calibration table.
     void apply_calibration(const int direction)
     {
         std::scoped_lock lock(reg_mutex);
+        const double frequency = getFrequency(direction, 0);
+        if (autocal.valid) {
+            const double cal_frequency = direction == SOAPY_SDR_RX
+                ? autocal.rx_frequency : autocal.tx_frequency;
+            if (calibration.empty() || std::abs(frequency - cal_frequency) <= AUTOCAL_TOLERANCE) {
+                std::scoped_lock corr_lock(corr_mutex);
+                if (direction == SOAPY_SDR_RX) {
+                    table_rx_iq = autocal.rx_iq;
+                } else {
+                    table_tx_dc = autocal.tx_dc;
+                    table_tx_iq = autocal.tx_iq;
+                }
+                update_corrections();
+                return;
+            }
+        }
         if (calibration.empty())
             return;
-        auto point = interpolate_calibration(calibration, getFrequency(direction, 0));
+        auto point = interpolate_calibration(calibration, frequency);
         std::scoped_lock corr_lock(corr_mutex);
         if (direction == SOAPY_SDR_RX) {
             table_rx_iq = point.rx_iq;
@@ -932,7 +1036,10 @@ public:
         table_rx_iq(0.0), table_tx_iq(0.0), table_tx_dc(0.0),
         user_rx_iq(0.0), user_tx_iq(0.0), user_tx_dc(0.0),
         rx_dc_cutoff(10.0),
-        rx_dc_state(0.0, 0.0)
+        rx_dc_state(0.0, 0.0),
+        autocal{false, 0.0, 0.0, 0, 0.0, 0.0, 0.0},
+        auto_calibrate(args.count("auto_calibrate") > 0 && args.at("auto_calibrate") == "1"),
+        pa_mode("AUTO")
     {
         SoapySDR_logf(SOAPY_SDR_INFO, "Initializing SoapySX");
 
@@ -1052,6 +1159,11 @@ public:
             SoapySDR_logf(SOAPY_SDR_ERROR, "Stream was already activated");
             return SOAPY_SDR_STREAM_ERROR;
         }
+
+        // Run automatic calibration before streams start
+        if (auto_calibrate && !alsa_rx.activated && !alsa_tx.activated && calibration_needed())
+            run_calibration();
+
         stream->activated = 1;
 
         if (stream->stream_mode == STREAM_MODE_NORMAL) {
@@ -1479,6 +1591,15 @@ public:
         (void)channel; (void)args;
 
         std::scoped_lock lock(reg_mutex);
+        write_frequency(direction, frequency);
+        apply_calibration(direction);
+    }
+
+    // Write synthesizer frequency registers
+    // without updating corrections.
+    void write_frequency(const int direction, const double frequency)
+    {
+        std::scoped_lock lock(reg_mutex);
 
         const double step = masterClock * (1.0 / (double)(1L<<20));
         const uint32_t quantized = (uint32_t)scale_from_range(
@@ -1495,7 +1616,6 @@ public:
             set_register_bits(0x06, 0, 8, quantized & 0xFF);
             write_registers_to_chip(0x04, 3);
         }
-        apply_calibration(direction);
     }
 
     double getFrequency(
@@ -1800,6 +1920,326 @@ public:
     }
 
 /***********************************************************************
+ * Built-in calibration
+ **********************************************************************/
+private:
+
+    // State of a running calibration
+    struct cal_state {
+        // Samples read from RX and written to TX
+        int64_t rx_count, tx_count;
+        // RX sample index from which on current settings are in effect
+        int64_t valid_from;
+        // Normalized frequency difference of TX and RX LO
+        double lo_offset;
+        // Extra samples to skip after next change, e.g. for PLL lock
+        int64_t extra_settle;
+        // Corrections being tested
+        struct rx_corrections rx;
+        struct tx_corrections tx;
+        // Raw sample buffers
+        std::vector<int32_t> raw;
+        std::vector<std::complex<float>> tone, converted;
+    };
+
+    static const size_t CAL_CHUNK = 1024;
+    // How far ahead TX is written
+    static const snd_pcm_sframes_t CAL_TX_AHEAD = 16384;
+    // Samples to skip after a change, for filters to settle
+    static const int64_t CAL_SETTLE = 2048;
+    static const size_t CAL_LENGTH = 8192;
+    static constexpr float CAL_AMPLITUDE = 0.25f;
+    static constexpr double CAL_MIN_SNR = 40.0;
+
+    bool calibration_needed(void)
+    {
+        std::scoped_lock lock(reg_mutex);
+        return !autocal.valid
+            || std::abs(getFrequency(SOAPY_SDR_TX, 0) - autocal.tx_frequency) > AUTOCAL_TOLERANCE
+            || std::abs(getFrequency(SOAPY_SDR_RX, 0) - autocal.rx_frequency) > AUTOCAL_TOLERANCE
+            || regs[0x08] != autocal.tx_gain_reg;
+    }
+
+    // Write TX samples to keep TX CAL_TX_AHEAD samples ahead,
+    // then read one chunk of RX samples into st.converted.
+    void cal_pump(struct cal_state &st)
+    {
+        snd_pcm_sframes_t delay = 0;
+        if (snd_pcm_delay(alsa_tx.pcm, &delay) < 0)
+            delay = 0;
+        if (delay < 0) {
+            // TX has underrun. Skip forward to keep TX sample count
+            // in sync with time, so that the tone stays continuous.
+            snd_pcm_sframes_t forwarded = snd_pcm_forward(alsa_tx.pcm, -delay);
+            if (forwarded > 0)
+                st.tx_count += forwarded;
+            delay = 0;
+        }
+        while (delay < CAL_TX_AHEAD) {
+            for (size_t i = 0; i < CAL_CHUNK; i++) {
+                double phase = 2.0 * M_PI * std::fmod(CAL_TONE * (double)(st.tx_count + (int64_t)i), 1.0);
+                st.tone[i] = std::polar(CAL_AMPLITUDE, (float)phase);
+            }
+            convert_tx_buffer(st.tone.data(), 0, st.raw.data(), 0, CAL_CHUNK, 0.0f, st.tx);
+            snd_pcm_sframes_t ret = snd_pcm_writei(alsa_tx.pcm, st.raw.data(), CAL_CHUNK);
+            if (ret < 0)
+                throw std::runtime_error("TX error during calibration: " + std::string(snd_strerror((int)ret)));
+            st.tx_count += ret;
+            delay += ret;
+        }
+        if (snd_pcm_state(alsa_rx.pcm) != SND_PCM_STATE_RUNNING)
+            return;
+        snd_pcm_sframes_t ret = snd_pcm_readi(alsa_rx.pcm, st.raw.data(), CAL_CHUNK);
+        if (ret < 0)
+            throw std::runtime_error("RX error during calibration: " + std::string(snd_strerror((int)ret)));
+        std::complex<double> dc_state = 0.0;
+        st.converted.resize(ret);
+        convert_rx_buffer(st.raw.data(), 0, st.converted.data(), 0, ret, st.rx, dc_state);
+        st.rx_count += ret;
+    }
+
+    // Mark samples received before current settings take effect as invalid.
+    void cal_settings_changed(struct cal_state &st)
+    {
+        snd_pcm_sframes_t rx_avail = snd_pcm_avail(alsa_rx.pcm);
+        snd_pcm_sframes_t tx_delay = 0;
+        if (snd_pcm_delay(alsa_tx.pcm, &tx_delay) < 0)
+            tx_delay = 0;
+        // RX sample being received now, plus time TX samples
+        // written from now on take to be transmitted.
+        st.valid_from = st.rx_count + std::max(rx_avail, (snd_pcm_sframes_t)0)
+            + std::max(tx_delay, (snd_pcm_sframes_t)0) + CAL_SETTLE + st.extra_settle;
+        st.extra_settle = 0;
+    }
+
+    struct cal_measurement cal_measure(struct cal_state &st)
+    {
+        std::vector<std::complex<float>> x;
+        x.reserve(CAL_LENGTH);
+        int64_t n0 = -1;
+        while (x.size() < CAL_LENGTH) {
+            int64_t start = st.rx_count;
+            cal_pump(st);
+            for (size_t i = 0; i < st.converted.size() && x.size() < CAL_LENGTH; i++) {
+                if (start + (int64_t)i < st.valid_from)
+                    continue;
+                if (n0 < 0)
+                    n0 = start + (int64_t)i;
+                x.push_back(st.converted[i]);
+            }
+        }
+        return cal_analyze(x, n0, st.lo_offset);
+    }
+
+    // Find value of a correction nulling a complex measurement.
+    // Jacobian with respect to real and imaginary part of the correction
+    // is estimated from perturbations, so unknown phase shifts in the
+    // loopback do not matter. Returns levels before and after.
+    std::pair<double, double> cal_null_search(
+        struct cal_state &st,
+        std::complex<float> &value,
+        std::complex<double> (*objective)(const struct cal_measurement &))
+    {
+        auto evaluate = [&](std::complex<double> v) {
+            value = std::complex<float>(v);
+            cal_settings_changed(st);
+            return objective(cal_measure(st));
+        };
+        const double target = std::pow(10.0, -70.0 / 20.0);
+        double step = 0.01;
+        std::complex<double> p = std::complex<double>(value);
+        std::complex<double> f0 = evaluate(p);
+        const double first = std::abs(f0);
+        double best_level = first;
+        std::complex<double> best = p;
+        for (int iteration = 0; iteration < 4 && std::abs(f0) > target; iteration++) {
+            std::complex<double> fx = evaluate(p + step);
+            std::complex<double> fy = evaluate(p + std::complex<double>(0.0, step));
+            // Solve J * dp = -f0, where columns of J are (fx-f0)/step and (fy-f0)/step
+            double a = (fx - f0).real() / step, b = (fy - f0).real() / step;
+            double c = (fx - f0).imag() / step, d = (fy - f0).imag() / step;
+            double det = a * d - b * c;
+            if (det == 0.0 || !std::isfinite(det))
+                break;
+            std::complex<double> dp(
+                (-f0.real() * d + f0.imag() * b) / det,
+                (-f0.imag() * a + f0.real() * c) / det);
+            p += dp;
+            f0 = evaluate(p);
+            if (std::abs(f0) < best_level) {
+                best_level = std::abs(f0);
+                best = p;
+            }
+            step = std::min(step, std::max(std::abs(dp), step / 10.0));
+        }
+        value = std::complex<float>(best);
+        return std::make_pair(to_db(first), to_db(best_level));
+    }
+
+    // Choose RX PGA gain giving a reasonable level for the loopback signal.
+    void cal_adjust_rx_gain(struct cal_state &st)
+    {
+        unsigned pga = 15;
+        while (true) {
+            set_register_bits(0x0C, 1, 4, pga);
+            write_registers_to_chip(0x0C, 1);
+            cal_settings_changed(st);
+            auto m = cal_measure(st);
+            if (m.peak < 0.3 || pga < 2)
+                break;
+            pga -= 2;
+        }
+    }
+
+    // Calibrate with TX LO at tx_frequency and RX LO below it.
+    // If rx_only is set, only RX IQ balance is calibrated.
+    // Returns false if loopback signal is not received.
+    bool cal_pass(struct cal_state &st, double tx_frequency, bool rx_only)
+    {
+        const double step = masterClock * (1.0 / (double)(1L<<20));
+        const double offset = std::round(CAL_LO_OFFSET * sampleRate / step) * step;
+        write_frequency(SOAPY_SDR_TX, tx_frequency);
+        write_frequency(SOAPY_SDR_RX, tx_frequency - offset);
+        st.lo_offset = (getFrequency(SOAPY_SDR_TX, 0) - getFrequency(SOAPY_SDR_RX, 0)) / sampleRate;
+        // Wait 20 ms for PLLs to lock. Streams keep running meanwhile.
+        st.extra_settle = (int64_t)(0.02 * sampleRate);
+
+        cal_adjust_rx_gain(st);
+        cal_settings_changed(st);
+        auto m = cal_measure(st);
+        const double snr = to_db(std::abs(m.tone)) - to_db(m.noise);
+        SoapySDR_logf(SOAPY_SDR_INFO, "Calibrating at TX %.3f MHz: tone %.1f dBFS, SNR %.1f dB",
+            tx_frequency * 1e-6, to_db(std::abs(m.tone)), snr);
+        if (snr < CAL_MIN_SNR) {
+            SoapySDR_logf(SOAPY_SDR_ERROR, "Calibration failed: loopback signal not received. "
+                "Check with tools/calibrate.py --diagnose.");
+            return false;
+        }
+
+        auto rx = cal_null_search(st, st.rx.iq, [](const struct cal_measurement &m) {
+            return m.rx_image / std::conj(m.tone);
+        });
+        SoapySDR_logf(SOAPY_SDR_INFO, "  RX image      %6.1f dBc -> %6.1f dBc", rx.first, rx.second);
+        if (rx_only)
+            return true;
+        auto tx_image = cal_null_search(st, st.tx.iq, [](const struct cal_measurement &m) {
+            return m.tx_image / m.tone;
+        });
+        SoapySDR_logf(SOAPY_SDR_INFO, "  TX image      %6.1f dBc -> %6.1f dBc", tx_image.first, tx_image.second);
+        auto tx_lo = cal_null_search(st, st.tx.dc, [](const struct cal_measurement &m) {
+            return m.tx_lo / m.tone;
+        });
+        SoapySDR_logf(SOAPY_SDR_INFO, "  TX LO leakage %6.1f dBc -> %6.1f dBc", tx_lo.first, tx_lo.second);
+        return true;
+    }
+
+    // Calibrate TX DC offset, TX IQ balance and RX IQ balance at current
+    // frequencies and TX gains using the RF loopback.
+    // Streams must not be active. Caller must hold ALSA stream mutexes.
+    void run_calibration(void)
+    {
+        std::scoped_lock lock(reg_mutex);
+
+        const double tx_frequency = getFrequency(SOAPY_SDR_TX, 0);
+        const double rx_frequency = getFrequency(SOAPY_SDR_RX, 0);
+        const std::string saved_pa_mode = pa_mode;
+        uint8_t saved_regs[N_INIT_REGISTERS];
+        memcpy(saved_regs, regs, sizeof(saved_regs));
+        // ALSA devices must be configured even if application
+        // has not set up both streams.
+        if (!alsa_rx.setup_done)
+            alsa_rx.configure(0);
+        if (!alsa_tx.setup_done)
+            alsa_tx.configure(0);
+
+        SoapySDR_logf(SOAPY_SDR_INFO, "Starting calibration. Test tone is transmitted at %.3f MHz.",
+            tx_frequency * 1e-6);
+
+        struct cal_state st;
+        st.rx_count = 0;
+        st.tx_count = 0;
+        st.valid_from = 0;
+        st.lo_offset = 0.0;
+        st.extra_settle = 0;
+        {
+            std::scoped_lock corr_lock(corr_mutex);
+            st.rx = rx_corr;
+            st.tx = tx_corr;
+        }
+        st.rx.dc_removal = false;
+        st.raw.resize(CAL_CHUNK * 2);
+        st.tone.resize(CAL_CHUNK);
+
+        bool success = false;
+        std::complex<float> tx_dc, tx_iq, rx_iq;
+        try {
+            // RF loopback on, PA driver on. On some boards
+            // the loopback only works with external PA enabled.
+            set_register_bits(0x10, 2, 2, 1);
+            write_registers_to_chip(0x10, 1);
+            set_register_bits(0x00, 3, 1, 1);
+            write_registers_to_chip(0x00, 1);
+            writeSetting("PA", "AUTO");
+
+            alsa_rx.reset();
+            alsa_tx.reset();
+            // Prefill TX and start streams
+            cal_pump(st);
+            if (linked) {
+                snd_pcm_start(alsa_rx.pcm);
+            } else {
+                snd_pcm_start(alsa_tx.pcm);
+                snd_pcm_start(alsa_rx.pcm);
+            }
+
+            success = cal_pass(st, tx_frequency, false);
+            tx_dc = st.tx.dc;
+            tx_iq = st.tx.iq;
+            rx_iq = st.rx.iq;
+            // Calibrate RX IQ balance separately if RX frequency is
+            // far from TX frequency
+            if (success && std::abs(rx_frequency - tx_frequency) > AUTOCAL_TOLERANCE) {
+                const double step = masterClock * (1.0 / (double)(1L<<20));
+                const double offset = std::round(CAL_LO_OFFSET * sampleRate / step) * step;
+                success = cal_pass(st, rx_frequency + offset, true);
+                rx_iq = st.rx.iq;
+            }
+        } catch (std::exception &e) {
+            SoapySDR_logf(SOAPY_SDR_ERROR, "Calibration failed: %s", e.what());
+            success = false;
+        }
+
+        // Restore streams and registers
+        alsa_rx.reset();
+        alsa_tx.reset();
+        // Restore registers changed by calibration:
+        // enables, frequencies, gains and loopback.
+        memcpy(regs, saved_regs, sizeof(saved_regs));
+        write_registers_to_chip(0x00, 7);
+        write_registers_to_chip(0x08, 9);
+        writeSetting("PA", saved_pa_mode);
+
+        if (success) {
+            std::scoped_lock corr_lock(corr_mutex);
+            // Store total correction so that it does not depend
+            // on values set by the application.
+            autocal.valid = true;
+            autocal.tx_frequency = tx_frequency;
+            autocal.rx_frequency = rx_frequency;
+            autocal.tx_gain_reg = regs[0x08];
+            autocal.tx_dc = std::complex<double>(tx_dc) - user_tx_dc;
+            autocal.tx_iq = std::complex<double>(tx_iq) - user_tx_iq;
+            autocal.rx_iq = std::complex<double>(rx_iq) - user_rx_iq;
+            SoapySDR_logf(SOAPY_SDR_INFO, "Calibration done: tx_dc=%f%+fj tx_iq=%f%+fj rx_iq=%f%+fj",
+                tx_dc.real(), tx_dc.imag(), tx_iq.real(), tx_iq.imag(), rx_iq.real(), rx_iq.imag());
+        }
+        apply_calibration(SOAPY_SDR_RX);
+        apply_calibration(SOAPY_SDR_TX);
+    }
+
+public:
+
+/***********************************************************************
  * Other settings
  **********************************************************************/
 
@@ -1859,6 +2299,8 @@ public:
     {
         // PA control modes
         if (key == "PA") {
+            if (value == "ON" || value == "OFF" || value == "AUTO")
+                pa_mode = value;
             if (value == "ON") {
                 // PA always on
                 gpio_tx.set_value(1);
@@ -1874,6 +2316,11 @@ public:
             }
         } else if (key == "CALIBRATION_FILE") {
             load_calibration(value);
+        } else if (key == "CALIBRATE") {
+            std::scoped_lock lock(alsa_rx.mutex, alsa_tx.mutex);
+            if (alsa_rx.activated || alsa_tx.activated)
+                throw std::runtime_error("Calibration is only possible when streams are not active");
+            run_calibration();
         } else if (key == "RX_DC_CUTOFF") {
             {
                 std::scoped_lock lock(corr_mutex);
