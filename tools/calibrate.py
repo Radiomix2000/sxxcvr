@@ -23,9 +23,9 @@ unwanted product, relative to the wanted tone, is measured with the current
 correction and with two small perturbations of it, giving a 2x2 Jacobian.
 This does not need any knowledge of delays or phase shifts in the loopback.
 
-The RF loopback signal also leaks out of the antenna connector,
-so connect a dummy load or an attenuator while calibrating.
-The external PA is kept off.
+On some boards the loopback only works with the external PA enabled
+(--pa auto, the default), so the tone is also transmitted from the
+antenna connector. Connect a dummy load or an attenuator while calibrating.
 
 Corrections depend on TX gains, so calibrate with the TX gains you use.
 """
@@ -195,7 +195,8 @@ class Loopback:
         # The next TX chunk will be written with the new corrections,
         # so they will be in effect for samples after it.
         self._write_corrections()
-        self.valid_from = max(self.valid_from, self.next_tx + self.args.settle)
+        self.valid_from = max(self.valid_from, self.next_tx + self.args.settle,
+            self._now() + self.args.latency + self.args.settle)
 
     def _pump(self):
         """Read one chunk of RX samples and write one chunk of TX samples."""
@@ -206,13 +207,21 @@ class Loopback:
         n_rx = SoapySDR.timeNsToTicks(ret.timeNs, self.fs)
         if self.n_ref is None:
             self.n_ref = n_rx
-        # Transmit with a fixed latency from reception
-        n_tx = n_rx + self.args.latency
-        self.next_tx = n_tx + self.chunk
-        n = np.arange(n_tx, n_tx + self.chunk) - self.n_ref
-        tx = (self.amplitude * np.exp(2j * np.pi * np.mod(TONE * n, 1.0))).astype(np.complex64)
-        self.dev.writeStream(self.tx, [tx], len(tx), SoapySDR.SOAPY_SDR_HAS_TIME,
-            SoapySDR.ticksToTimeNs(n_tx, self.fs))
+        # Keep TX stream continuous and a fixed latency ahead of hardware time.
+        # RX samples may be old if they were not read for a while,
+        # so TX timing is based on hardware time instead of RX timestamps.
+        now = self._now()
+        if self.next_tx < now + self.chunk:
+            # TX has fallen behind (e.g. at start or after a pause),
+            # restart it in the future.
+            self.next_tx = now + self.args.latency
+        if self.next_tx < now + 2 * self.args.latency:
+            n_tx = self.next_tx
+            self.next_tx = n_tx + self.chunk
+            n = np.arange(n_tx, n_tx + self.chunk) - self.n_ref
+            tx = (self.amplitude * np.exp(2j * np.pi * np.mod(TONE * n, 1.0))).astype(np.complex64)
+            self.dev.writeStream(self.tx, [tx], len(tx), SoapySDR.SOAPY_SDR_HAS_TIME,
+                SoapySDR.ticksToTimeNs(n_tx, self.fs))
         return n_rx, self.rx_buf[:ret.ret].copy()
 
     def capture(self):
@@ -254,7 +263,7 @@ class Loopback:
             self.dev.writeSetting('PA', pa)
         if amplitude is not None:
             self.amplitude = amplitude
-        self.valid_from = max(self._now(), self.next_tx) + self.args.settle
+        self.valid_from = max(self._now() + self.args.latency, self.next_tx) + self.args.settle
 
     def adjust_rx_gain(self):
         """Find a PGA gain giving a reasonable signal level."""
@@ -454,7 +463,7 @@ def main():
     parser.add_argument('--tx-dac', type=float, default=6.0, help='TX DAC gain (default: %(default)s)')
     parser.add_argument('--tx-mixer', type=float, default=26.0, help='TX mixer gain (default: %(default)s)')
     parser.add_argument('--rx-pga', type=float, default=None, help='RX PGA gain (default: automatic)')
-    parser.add_argument('--amplitude', type=float, default=0.5, help='TX tone amplitude (default: %(default)s)')
+    parser.add_argument('--amplitude', type=float, default=0.25, help='TX tone amplitude (default: %(default)s)')
     parser.add_argument('--length', type=int, default=8192, help='Samples per measurement (default: %(default)s)')
     parser.add_argument('--chunk', type=int, default=1024, help='Stream chunk size (default: %(default)s)')
     parser.add_argument('--latency', type=int, default=4096, help='RX to TX latency in samples (default: %(default)s)')
@@ -465,8 +474,9 @@ def main():
     parser.add_argument('--step', type=float, default=0.01, help='Perturbation for Jacobian estimation (default: %(default)s)')
     parser.add_argument('--iterations', type=int, default=4, help='Maximum Newton iterations (default: %(default)s)')
     parser.add_argument('--target', type=float, default=-70.0, help='Stop when below this level in dBc (default: %(default)s)')
-    parser.add_argument('--pa', choices=('off', 'auto'), default='off',
-        help='External PA control during calibration (default: %(default)s)')
+    parser.add_argument('--pa', choices=('off', 'auto'), default='auto',
+        help='External PA control during calibration. On some boards the loopback '
+        'does not work with PA off. (default: %(default)s)')
     parser.add_argument('--min-snr', type=float, default=40.0,
         help='Minimum SNR of the received tone in dB (default: %(default)s)')
     parser.add_argument('--diagnose', action='store_true',
@@ -476,6 +486,9 @@ def main():
     args = parser.parse_args()
 
     frequencies = parse_frequencies(args.frequencies)
+    if not args.simulate and args.pa == 'auto':
+        print('WARNING: the test tone is transmitted through the external PA.')
+        print('Make sure a dummy load or an attenuator is connected to the antenna connector.')
     lb = Simulation(args) if args.simulate else Loopback(args)
 
     if args.diagnose:
@@ -513,6 +526,10 @@ def main():
                 for key, name in (('rx_image', 'RX image'), ('tx_image', 'TX image'), ('tx_lo', 'TX LO leakage')):
                     print('  %-14s %7.1f dBc -> %7.1f dBc' % (name, db(results[key][0]), final[key]))
                     worst[key] = max(worst[key], final[key])
+                if abs(corr.tx_dc) > 0.2:
+                    print('  Note: TX DC correction is %.0f %% of full scale, reducing headroom '
+                        'for the signal. Higher MIXER gain may reduce LO leakage relative to the signal.'
+                        % (100 * abs(corr.tx_dc)))
                 print('  tx_dc=%s tx_iq=%s rx_iq=%s' % (
                     np.round(corr.tx_dc, 5), np.round(corr.tx_iq, 5), np.round(corr.rx_iq, 5)))
                 out.write('%.0f %.7f %.7f %.7f %.7f %.7f %.7f\n' % (frequency,

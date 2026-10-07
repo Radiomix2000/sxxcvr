@@ -56,8 +56,11 @@ of SX1255 by running
 python3 tools/calibrate.py -f 420:450:1
 ```
 where `-f` gives the frequency range in MHz as start:stop:step.
-The loopback signal also leaks out of the antenna connector,
-so connect a dummy load or an attenuator while calibrating.
+The loopback only works with the external PA enabled on some boards,
+so the test tone is also transmitted from the antenna connector.
+Connect a dummy load or an attenuator while calibrating.
+If calibration fails, `tools/calibrate.py --diagnose` shows what is
+received with different settings.
 TX DC offset depends on TX gains, so give the TX gains you use
 with `--tx-dac` and `--tx-mixer`. See `tools/calibrate.py --help` for details.
 
